@@ -196,6 +196,7 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
     private let activePasteboardInterval = DispatchTimeInterval.milliseconds(50)
     private let activePollingBurstLength = 4
     private var activePollingChecksRemaining = 0
+    private let externalAppTranslator = ExternalAppTranslator()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -641,6 +642,9 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(makeMenuItem("Dosya yolunu kopyala", action: #selector(copyFilePath(_:)), context: context, enabled: fileURL != nil))
         menu.addItem(makeMenuItem("Metni kopyala (OCR)", action: #selector(copyOCRText(_:)), context: context))
         menu.addItem(.separator())
+        menu.addItem(makeMenuItem("ChatGPT’de çevir", action: #selector(translateWithChatGPT(_:)), context: context))
+        menu.addItem(makeMenuItem("Gemini’de çevir", action: #selector(translateWithGemini(_:)), context: context))
+        menu.addItem(.separator())
         menu.addItem(makeMenuItem("Görüntüyü Çöpe Taşı", action: #selector(moveImageToTrash(_:)), context: context, enabled: fileURL != nil))
         return menu
     }
@@ -758,6 +762,66 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    @objc private func translateWithChatGPT(_ sender: Any?) {
+        startExternalTranslation(target: .chatGPT, sender: sender)
+    }
+
+    @objc private func translateWithGemini(_ sender: Any?) {
+        startExternalTranslation(target: .gemini, sender: sender)
+    }
+
+    private func startExternalTranslation(target: TranslationTarget, sender: Any?) {
+        guard let context = context(from: sender) else { return }
+
+        let imageData: Data?
+        if let cachedImageData = context.imageData {
+            imageData = cachedImageData
+        } else if let fileURL = context.fileURL {
+            imageData = try? Data(contentsOf: fileURL, options: .mappedIfSafe)
+        } else {
+            imageData = nil
+        }
+
+        guard let imageData, !imageData.isEmpty else {
+            showTranslationError(ExternalAppTranslationError.imageUnavailable)
+            return
+        }
+
+        if let panel = context.panel {
+            dismissPreview(panel)
+        }
+
+        externalAppTranslator.send(imageData: imageData, to: target) { [weak self] result in
+            switch result {
+            case .success:
+                break
+            case let .failure(error):
+                self?.showTranslationError(error)
+            }
+        }
+    }
+
+    private func showTranslationError(_ error: Error) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Çeviri gönderilemedi"
+        alert.informativeText = error.localizedDescription
+
+        if let translationError = error as? ExternalAppTranslationError,
+           case .accessibilityRequired = translationError {
+            alert.addButton(withTitle: "Accessibility Ayarlarını Aç")
+            alert.addButton(withTitle: "İptal")
+            if alert.runModal() == .alertFirstButtonReturn {
+                externalAppTranslator.openAccessibilitySettings()
+            }
+            return
+        }
+
+        alert.addButton(withTitle: "Tamam")
+        alert.runModal()
     }
 
     private func showOCRResult(title: String, detail: String) {

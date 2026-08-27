@@ -13,6 +13,7 @@ application.
 - Uses the source application name in the file name.
 - Shows up to three previews with compact and card views.
 - Supports clipboard paste, file drag, context actions, OCR, and right-swipe dismissal.
+- Adds right-click actions to send a selected screenshot to a new ChatGPT or Gemini conversation for Turkish translation.
 - Validates PNG size, dimensions, and decodability before saving.
 - Uses no network connection and stores no credentials.
 
@@ -53,9 +54,18 @@ notarization. A distributable `.dmg` should be signed and notarized separately.
 ## Privacy and scope
 
 The app polls the general pasteboard for PNG data and reads the frontmost app
-name to choose a folder. It does not upload screenshots or make network calls.
+name to choose a folder. The helper itself does not make network calls.
 Screenshots may contain private information; keep the output folders local and
 do not commit them to a repository.
+
+The right-click translation actions use the installed ChatGPT and Gemini
+desktop applications, not API keys or account credentials. They require
+Accessibility permission for Screenshot Clipboard so macOS can activate the
+target app, paste the selected image and translation prompt, and submit it.
+Translation starts only after an explicit right-click action; screenshots are
+not sent automatically in the background. The selected target application may
+send the image to its own online service. If the target app has no accessible
+message field, the app stops without pasting or submitting the screenshot.
 
 The current implementation uses a fixed bundle identifier
 `com.zekiakgul.screenshot-clipboard`. Forks should change the identifier in

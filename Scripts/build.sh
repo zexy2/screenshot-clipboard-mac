@@ -15,9 +15,10 @@ mkdir -p "$(dirname -- "$EXECUTABLE")"
   -framework AppKit \
   -framework Foundation \
   -framework ImageIO \
+  -framework ApplicationServices \
   -framework Vision \
   -o "$EXECUTABLE" \
-  "$PROJECT_DIR/Sources/ScreenshotClipboard/main.swift"
+  "$PROJECT_DIR/Sources/ScreenshotClipboard"/*.swift
 
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 
