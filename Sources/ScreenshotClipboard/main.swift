@@ -192,6 +192,10 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
     private let pendingImageLock = NSLock()
     private var pendingImageCount = 0
     private let maximumPendingImageCount = 20
+    private let normalPasteboardInterval = DispatchTimeInterval.milliseconds(100)
+    private let activePasteboardInterval = DispatchTimeInterval.milliseconds(50)
+    private let activePollingBurstLength = 4
+    private var activePollingChecksRemaining = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -206,9 +210,11 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
         }
 
         let pasteboardTimer = DispatchSource.makeTimerSource(queue: pasteboardQueue)
-        pasteboardTimer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(1))
+        pasteboardTimer.schedule(deadline: .now(), repeating: normalPasteboardInterval, leeway: .milliseconds(10))
         pasteboardTimer.setEventHandler { [weak self] in
-            self?.checkPasteboard()
+            guard let self else { return }
+            let didDetectImage = self.checkPasteboard()
+            self.adjustPasteboardPolling(afterDetectingImage: didDetectImage)
         }
         pasteboardTimer.resume()
         self.pasteboardTimer = pasteboardTimer
@@ -225,16 +231,38 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
-    private func checkPasteboard() {
+    private func adjustPasteboardPolling(afterDetectingImage didDetectImage: Bool) {
+        if didDetectImage {
+            activePollingChecksRemaining = activePollingBurstLength
+            pasteboardTimer?.schedule(
+                deadline: .now() + activePasteboardInterval,
+                repeating: activePasteboardInterval,
+                leeway: .milliseconds(5)
+            )
+            return
+        }
+
+        guard activePollingChecksRemaining > 0 else { return }
+        activePollingChecksRemaining -= 1
+        if activePollingChecksRemaining == 0 {
+            pasteboardTimer?.schedule(
+                deadline: .now() + normalPasteboardInterval,
+                repeating: normalPasteboardInterval,
+                leeway: .milliseconds(10)
+            )
+        }
+    }
+
+    private func checkPasteboard() -> Bool {
         let changeCount = pasteboard.changeCount
-        guard changeCount != lastChangeCount else { return }
+        guard changeCount != lastChangeCount else { return false }
         lastChangeCount = changeCount
 
-        guard let imageData = pasteboard.data(forType: .png), !imageData.isEmpty else { return }
+        guard let imageData = pasteboard.data(forType: .png), !imageData.isEmpty else { return false }
 
         guard reservePendingImageSlot() else {
             NSLog("Screenshot Clipboard: görüntü kuyruğu dolu; yeni pano görüntüsü atlandı")
-            return
+            return true
         }
 
         let applicationName = currentUserApplicationName()
@@ -270,6 +298,7 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+        return true
     }
 
     @objc private func updateLastUserApplicationName() {
