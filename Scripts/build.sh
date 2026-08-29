@@ -16,6 +16,8 @@ mkdir -p "$(dirname -- "$EXECUTABLE")"
   -framework Foundation \
   -framework ImageIO \
   -framework ApplicationServices \
+  -Xlinker -weak_framework \
+  -Xlinker Translation \
   -framework Vision \
   -o "$EXECUTABLE" \
   "$PROJECT_DIR/Sources/ScreenshotClipboard"/*.swift

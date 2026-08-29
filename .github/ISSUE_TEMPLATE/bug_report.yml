@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible problem with Screenshot Clipboard.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include private screenshots, account data, passwords, tokens, or API keys.
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: macOS 26.0.1
+    validations:
+      required: true
+  - type: input
+    id: architecture
+    attributes:
+      label: Mac architecture
+      placeholder: Apple silicon or Intel
+    validations:
+      required: true
+  - type: dropdown
+    id: feature
+    attributes:
+      label: Affected feature
+      options:
+        - Preview
+        - Clipboard
+        - File saving or foldering
+        - Drag and drop
+        - OCR
+        - Native translation
+        - ChatGPT/Gemini handoff
+        - Install or startup
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Give the smallest sequence that reproduces the problem.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: permissions
+    attributes:
+      label: Permission and diagnostic details
+      description: State Desktop and Accessibility permission status and include ./Scripts/check.sh output if available.

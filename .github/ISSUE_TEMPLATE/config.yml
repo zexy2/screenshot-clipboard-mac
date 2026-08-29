@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Troubleshooting guide
+    url: https://github.com/zexy2/screenshot-clipboard-mac/blob/main/docs/troubleshooting.md
+    about: Check common permission, clipboard, and external-app issues first.

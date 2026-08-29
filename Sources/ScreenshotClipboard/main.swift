@@ -26,6 +26,21 @@ private struct SavedImage {
     }
 }
 
+private struct PendingNativeTranslation {
+    let sourceText: String
+    let correctedText: String
+    let translatedText: String
+    let targetProcessIdentifier: pid_t
+}
+
+private enum TranslationPreferenceKey {
+    static let direction = "nativeTranslation.direction"
+    static let mode = "nativeTranslation.mode"
+    static let shortcutKeyCode = "nativeTranslation.shortcut.keyCode"
+    static let shortcutKeyLabel = "nativeTranslation.shortcut.keyLabel"
+    static let shortcutModifiers = "nativeTranslation.shortcut.modifiers"
+}
+
 private final class ScreenshotDragDataProvider: NSObject, NSPasteboardItemDataProvider {
     private let imageData: Data
 
@@ -153,7 +168,7 @@ extension DraggableImageView: NSDraggingSource {
     }
 }
 
-final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
+final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let pasteboard = NSPasteboard.general
     private var screenshotRoot: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -197,10 +212,27 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
     private let activePollingBurstLength = 4
     private var activePollingChecksRemaining = 0
     private let externalAppTranslator = ExternalAppTranslator()
+    private let nativeTextTranslator = NativeTextTranslator()
+    private var statusItem: NSStatusItem?
+    private var clipboardTranslationMenuItem: NSMenuItem?
+    private var shortcutMenuItem: NSMenuItem?
+    private var globalTranslationShortcut: GlobalTranslationShortcut?
+    private var isNativeTextTranslationRunning = false
+    private var translationReviewPanel: TranslationReviewPanel?
+    private var translationFeedbackPanel: TranslationFeedbackPanel?
+    private var pendingNativeTranslation: PendingNativeTranslation?
+    private var translationSettingsWindow: NSWindow?
+    private var directionPopup: NSPopUpButton?
+    private var modePopup: NSPopUpButton?
+    private var shortcutButton: NSButton?
+    private var pendingShortcut = TranslationShortcutConfiguration.default
+    private var shortcutCaptureMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         updateLastUserApplicationName()
+        configureStatusItem()
+        configureGlobalTranslationShortcut()
 
         applicationActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
@@ -219,6 +251,7 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
         }
         pasteboardTimer.resume()
         self.pasteboardTimer = pasteboardTimer
+        restoreRecentPreviews()
     }
 
     deinit {
@@ -230,6 +263,145 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    private func configureStatusItem() {
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = statusItem.button {
+            button.image = NSImage(
+                systemSymbolName: "character.bubble",
+                accessibilityDescription: "Screenshot Clipboard"
+            )
+            button.toolTip = "Screenshot Clipboard"
+        }
+
+        let menu = NSMenu()
+        let clipboardTranslationItem = NSMenuItem(
+            title: "Panodaki metni İngilizceye çevir",
+            action: #selector(translateClipboardText(_:)),
+            keyEquivalent: ""
+        )
+        clipboardTranslationItem.target = self
+        menu.addItem(clipboardTranslationItem)
+        clipboardTranslationMenuItem = clipboardTranslationItem
+
+        let shortcutItem = NSMenuItem(
+            title: "Seçili metin için: \(storedShortcut().displayName)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        shortcutItem.isEnabled = false
+        menu.addItem(shortcutItem)
+        shortcutMenuItem = shortcutItem
+        menu.addItem(.separator())
+
+        let preferencesItem = NSMenuItem(
+            title: "Çeviri ayarları…",
+            action: #selector(openNativeTranslationPreferences(_:)),
+            keyEquivalent: ""
+        )
+        preferencesItem.target = self
+        menu.addItem(preferencesItem)
+
+        let translationSettingsItem = NSMenuItem(
+            title: "Çeviri dillerini aç",
+            action: #selector(openTranslationSettings(_:)),
+            keyEquivalent: ""
+        )
+        translationSettingsItem.target = self
+        menu.addItem(translationSettingsItem)
+
+        statusItem.menu = menu
+        self.statusItem = statusItem
+    }
+
+    private var translationDirection: NativeTranslationDirection {
+        get {
+            guard let rawValue = UserDefaults.standard.string(forKey: TranslationPreferenceKey.direction),
+                  let direction = NativeTranslationDirection(rawValue: rawValue)
+            else { return .turkishToEnglish }
+            return direction
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: TranslationPreferenceKey.direction)
+            updateTranslationMenuTitles()
+        }
+    }
+
+    private var translationMode: NativeTranslationMode {
+        get {
+            guard let rawValue = UserDefaults.standard.string(forKey: TranslationPreferenceKey.mode),
+                  let mode = NativeTranslationMode(rawValue: rawValue)
+            else { return .quick }
+            return mode
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: TranslationPreferenceKey.mode)
+        }
+    }
+
+    private func storedShortcut() -> TranslationShortcutConfiguration {
+        guard let keyCode = UserDefaults.standard.object(forKey: TranslationPreferenceKey.shortcutKeyCode) as? NSNumber,
+              let rawModifiers = UserDefaults.standard.object(forKey: TranslationPreferenceKey.shortcutModifiers) as? NSNumber
+        else { return .default }
+
+        let label = UserDefaults.standard.string(forKey: TranslationPreferenceKey.shortcutKeyLabel) ?? ""
+        return TranslationShortcutConfiguration(
+            keyCode: CGKeyCode(keyCode.uint16Value),
+            keyLabel: label,
+            modifierFlagsRawValue: rawModifiers.uint64Value
+        )
+    }
+
+    private func configureGlobalTranslationShortcut() {
+        globalTranslationShortcut = GlobalTranslationShortcut(configuration: storedShortcut()) { [weak self] in
+            self?.translateSelectedText()
+        }
+        shortcutMenuItem?.title = "Seçili metin için: \(storedShortcut().displayName)"
+        updateTranslationMenuTitles()
+    }
+
+    private func updateTranslationMenuTitles() {
+        let targetName = translationDirection == .turkishToEnglish ? "İngilizceye" : "Türkçeye"
+        clipboardTranslationMenuItem?.title = "Panodaki metni \(targetName) çevir"
+    }
+
+    private func restoreRecentPreviews() {
+        let folder = generalScreenshotFolder
+        imageProcessingQueue.async { [weak self] in
+            guard let self else { return }
+            let keys: [URLResourceKey] = [.isRegularFileKey, .contentModificationDateKey]
+            let urls = (try? FileManager.default.contentsOfDirectory(
+                at: folder,
+                includingPropertiesForKeys: keys,
+                options: [.skipsHiddenFiles]
+            )) ?? []
+
+            let recentURLs = urls
+                .filter { url in
+                    guard let values = try? url.resourceValues(forKeys: Set(keys)) else { return false }
+                    return values.isRegularFile == true && url.pathExtension.lowercased() == "png"
+                }
+                .sorted { lhs, rhs in
+                    let leftDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? nil
+                    let rightDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? nil
+                    return (leftDate ?? .distantPast) > (rightDate ?? .distantPast)
+                }
+                .prefix(3)
+
+            let previews = recentURLs.compactMap { url -> (Data, URL)? in
+                guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+                      !data.isEmpty
+                else { return nil }
+                return (data, url)
+            }
+
+            DispatchQueue.main.async {
+                previews.reversed().forEach { data, url in
+                    self.enqueuePreview(data, fileURL: url, canonicalFileURL: url)
+                }
+            }
+        }
     }
 
     private func adjustPasteboardPolling(afterDetectingImage didDetectImage: Bool) {
@@ -670,6 +842,441 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
         pasteboard.setString(fileURL.path, forType: .string)
     }
 
+    @objc private func openNativeTranslationPreferences(_ sender: Any?) {
+        if let translationSettingsWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            translationSettingsWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 285),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Metin çevirisi ayarları"
+        window.level = .floating
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+
+        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 285))
+        let directionLabel = NSTextField(labelWithString: "Çeviri yönü")
+        directionLabel.frame = NSRect(x: 28, y: 220, width: 130, height: 24)
+        contentView.addSubview(directionLabel)
+
+        let directionPopup = NSPopUpButton(frame: NSRect(x: 170, y: 216, width: 275, height: 30), pullsDown: false)
+        NativeTranslationDirection.allCases.forEach { direction in
+            directionPopup.addItem(withTitle: direction.displayName)
+            directionPopup.lastItem?.representedObject = direction.rawValue
+        }
+        directionPopup.selectItem(withTitle: translationDirection.displayName)
+        contentView.addSubview(directionPopup)
+        self.directionPopup = directionPopup
+
+        let modeLabel = NSTextField(labelWithString: "Çalışma modu")
+        modeLabel.frame = NSRect(x: 28, y: 165, width: 130, height: 24)
+        contentView.addSubview(modeLabel)
+
+        let modePopup = NSPopUpButton(frame: NSRect(x: 170, y: 161, width: 275, height: 30), pullsDown: false)
+        NativeTranslationMode.allCases.forEach { mode in
+            modePopup.addItem(withTitle: mode.displayName)
+            modePopup.lastItem?.representedObject = mode.rawValue
+        }
+        modePopup.selectItem(withTitle: translationMode.displayName)
+        contentView.addSubview(modePopup)
+        self.modePopup = modePopup
+
+        let shortcutLabel = NSTextField(labelWithString: "Kısayol")
+        shortcutLabel.frame = NSRect(x: 28, y: 110, width: 130, height: 24)
+        contentView.addSubview(shortcutLabel)
+
+        let shortcutButton = NSButton(frame: NSRect(x: 170, y: 105, width: 275, height: 32))
+        shortcutButton.title = storedShortcut().displayName
+        shortcutButton.target = self
+        shortcutButton.action = #selector(captureTranslationShortcut(_:))
+        shortcutButton.bezelStyle = .rounded
+        contentView.addSubview(shortcutButton)
+        self.shortcutButton = shortcutButton
+        pendingShortcut = storedShortcut()
+
+        let note = NSTextField(wrappingLabelWithString: "Kısayol kaydı için Command, Option, Control veya Shift tuşlarından en az birini basılı tut.")
+        note.frame = NSRect(x: 28, y: 58, width: 417, height: 34)
+        note.textColor = .secondaryLabelColor
+        note.font = .systemFont(ofSize: 11)
+        contentView.addSubview(note)
+
+        let cancelButton = NSButton(frame: NSRect(x: 250, y: 18, width: 92, height: 30))
+        cancelButton.title = "İptal"
+        cancelButton.target = self
+        cancelButton.action = #selector(cancelTranslationPreferences(_:))
+        cancelButton.bezelStyle = .rounded
+        contentView.addSubview(cancelButton)
+
+        let saveButton = NSButton(frame: NSRect(x: 350, y: 18, width: 95, height: 30))
+        saveButton.title = "Kaydet"
+        saveButton.target = self
+        saveButton.action = #selector(saveTranslationPreferences(_:))
+        saveButton.bezelStyle = .rounded
+        saveButton.keyEquivalent = "\r"
+        contentView.addSubview(saveButton)
+
+        window.contentView = contentView
+        translationSettingsWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func captureTranslationShortcut(_ sender: Any?) {
+        stopShortcutCapture()
+        shortcutButton?.title = "Tuşlara bas…"
+        shortcutButton?.state = .on
+        shortcutCaptureMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            if event.keyCode == 53 {
+                self.stopShortcutCapture()
+                self.shortcutButton?.title = self.pendingShortcut.displayName
+                return nil
+            }
+
+            let modifiers = event.modifierFlags.intersection([.command, .option, .shift, .control])
+            guard !modifiers.isEmpty else {
+                NSSound.beep()
+                return nil
+            }
+
+            self.pendingShortcut = TranslationShortcutConfiguration(
+                keyCode: event.keyCode,
+                keyLabel: self.keyLabel(for: event),
+                modifiers: modifiers
+            )
+            self.shortcutButton?.title = self.pendingShortcut.displayName
+            self.stopShortcutCapture()
+            return nil
+        }
+    }
+
+    private func stopShortcutCapture() {
+        if let shortcutCaptureMonitor {
+            NSEvent.removeMonitor(shortcutCaptureMonitor)
+            self.shortcutCaptureMonitor = nil
+        }
+        shortcutButton?.state = .off
+    }
+
+    private func keyLabel(for event: NSEvent) -> String {
+        switch event.keyCode {
+        case 36: return "Return"
+        case 48: return "Tab"
+        case 49: return "Space"
+        case 51: return "Delete"
+        case 53: return "Esc"
+        case 123: return "←"
+        case 124: return "→"
+        case 125: return "↓"
+        case 126: return "↑"
+        default:
+            return event.charactersIgnoringModifiers?.uppercased().first.map(String.init) ?? "Tuş"
+        }
+    }
+
+    @objc private func saveTranslationPreferences(_ sender: Any?) {
+        if let rawDirection = directionPopup?.selectedItem?.representedObject as? String,
+           let direction = NativeTranslationDirection(rawValue: rawDirection) {
+            translationDirection = direction
+        }
+        if let rawMode = modePopup?.selectedItem?.representedObject as? String,
+           let mode = NativeTranslationMode(rawValue: rawMode) {
+            translationMode = mode
+        }
+
+        let defaults = UserDefaults.standard
+        defaults.set(Int(pendingShortcut.keyCode), forKey: TranslationPreferenceKey.shortcutKeyCode)
+        defaults.set(pendingShortcut.keyLabel, forKey: TranslationPreferenceKey.shortcutKeyLabel)
+        defaults.set(Int(pendingShortcut.modifierFlagsRawValue), forKey: TranslationPreferenceKey.shortcutModifiers)
+        configureGlobalTranslationShortcut()
+        translationSettingsWindow?.close()
+    }
+
+    @objc private func cancelTranslationPreferences(_ sender: Any?) {
+        translationSettingsWindow?.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        stopShortcutCapture()
+        guard let window = notification.object as? NSWindow,
+              window === translationSettingsWindow
+        else { return }
+        directionPopup = nil
+        modePopup = nil
+        shortcutButton = nil
+        translationSettingsWindow = nil
+    }
+
+    @objc private func openTranslationSettings(_ sender: Any?) {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.general?Language_Region") else {
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func translateClipboardText(_ sender: Any?) {
+        guard beginNativeTextTranslation() else { return }
+
+        let snapshot = PasteboardSnapshot(pasteboard: pasteboard)
+        guard let sourceText = pasteboard.string(forType: .string),
+              !sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            finishNativeTextTranslation()
+            showNativeTextTranslationError(NativeTextTranslationError.emptyText)
+            return
+        }
+
+        let normalization = translationDirection == .turkishToEnglish
+            ? TurkishTextNormalizer.normalize(sourceText)
+            : TextNormalizationResult(text: sourceText, corrections: [])
+
+        nativeTextTranslator.translate(normalization.text, direction: translationDirection) { [weak self] result in
+            guard let self else { return }
+            self.finishNativeTextTranslation()
+
+            switch result {
+            case let .success(translatedText):
+                let pending = PendingNativeTranslation(
+                    sourceText: sourceText,
+                    correctedText: normalization.text,
+                    translatedText: translatedText,
+                    targetProcessIdentifier: 0
+                )
+                if self.translationMode == .review {
+                    self.showNativeTranslationReview(pending)
+                } else {
+                    self.setClipboardText(translatedText)
+                    self.showNativeTextTranslationSuccess("Pano metni çevrildi.")
+                }
+            case let .failure(error):
+                snapshot.restore(to: self.pasteboard)
+                self.showNativeTextTranslationError(error)
+            }
+        }
+    }
+
+    private func translateSelectedText() {
+        guard shortcutCaptureMonitor == nil else { return }
+        guard beginNativeTextTranslation() else { return }
+
+        guard AccessibilityTextSelection.isTrusted() else {
+            finishNativeTextTranslation()
+            showNativeTextTranslationError(NativeTextTranslationError.accessibilityRequired)
+            return
+        }
+
+        guard let frontmostApplication = NSWorkspace.shared.frontmostApplication,
+              frontmostApplication.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        else {
+            finishNativeTextTranslation()
+            showNativeTextTranslationError(NativeTextTranslationError.noSelectedText)
+            return
+        }
+
+        let snapshot = PasteboardSnapshot(pasteboard: pasteboard)
+        let selectedText = AccessibilityTextSelection.selectedText()
+        let sourceText: String?
+        if let selectedText {
+            sourceText = selectedText
+        } else {
+            let previousChangeCount = pasteboard.changeCount
+            KeyboardEventPoster.postCommandKey(8) // C
+            Thread.sleep(forTimeInterval: 0.12)
+            sourceText = pasteboard.changeCount != previousChangeCount
+                ? pasteboard.string(forType: .string)
+                : nil
+        }
+
+        guard let sourceText,
+              !sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            snapshot.restore(to: pasteboard)
+            finishNativeTextTranslation()
+            showNativeTextTranslationError(NativeTextTranslationError.noSelectedText)
+            return
+        }
+
+        let normalization = translationDirection == .turkishToEnglish
+            ? TurkishTextNormalizer.normalize(sourceText)
+            : TextNormalizationResult(text: sourceText, corrections: [])
+
+        nativeTextTranslator.translate(normalization.text, direction: translationDirection) { [weak self] result in
+            guard let self else { return }
+            self.finishNativeTextTranslation()
+
+            switch result {
+            case let .success(translatedText):
+                let pending = PendingNativeTranslation(
+                    sourceText: sourceText,
+                    correctedText: normalization.text,
+                    translatedText: translatedText,
+                    targetProcessIdentifier: frontmostApplication.processIdentifier
+                )
+                snapshot.restore(to: self.pasteboard)
+                if self.translationMode == .review {
+                    self.showNativeTranslationReview(pending)
+                } else {
+                    self.applyNativeTranslation(pending)
+                }
+            case let .failure(error):
+                snapshot.restore(to: self.pasteboard)
+                self.showNativeTextTranslationError(error)
+            }
+        }
+    }
+
+    private func beginNativeTextTranslation() -> Bool {
+        guard !isNativeTextTranslationRunning else {
+            showNativeTextTranslationError(NativeTextTranslationError.alreadyRunning)
+            return false
+        }
+        isNativeTextTranslationRunning = true
+        return true
+    }
+
+    private func finishNativeTextTranslation() {
+        isNativeTextTranslationRunning = false
+    }
+
+    private func setClipboardText(_ text: String) {
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    private func applyNativeTranslation(_ pending: PendingNativeTranslation) {
+        guard pending.targetProcessIdentifier != 0 else {
+            setClipboardText(pending.translatedText)
+            showNativeTextTranslationSuccess("Pano metni çevrildi.")
+            return
+        }
+
+        guard let frontmostApplication = NSWorkspace.shared.frontmostApplication,
+              frontmostApplication.processIdentifier == pending.targetProcessIdentifier
+        else {
+            setClipboardText(pending.translatedText)
+            showNativeTextTranslationError(NativeTextTranslationError.targetApplicationChanged)
+            return
+        }
+
+        if let currentSelection = AccessibilityTextSelection.selectedText(),
+           currentSelection.trimmingCharacters(in: .whitespacesAndNewlines)
+                != pending.sourceText.trimmingCharacters(in: .whitespacesAndNewlines) {
+            setClipboardText(pending.translatedText)
+            showNativeTextTranslationError(NativeTextTranslationError.selectionChanged)
+            return
+        }
+
+        setClipboardText(pending.translatedText)
+        KeyboardEventPoster.postCommandKey(9) // V
+        showNativeTextTranslationSuccess("Seçili metin çevrildi ve yerine yazıldı.")
+    }
+
+    private func showNativeTranslationReview(_ pending: PendingNativeTranslation) {
+        translationReviewPanel?.close()
+        pendingNativeTranslation = pending
+
+        let panel = TranslationReviewPanel(
+            correctedText: pending.correctedText,
+            translatedText: pending.translatedText
+        )
+        panel.onApply = { [weak self, weak panel] in
+            guard let self else { return }
+            self.pendingNativeTranslation = nil
+            if self.translationReviewPanel === panel {
+                self.translationReviewPanel = nil
+            }
+            self.applyNativeTranslation(pending)
+        }
+        panel.onCancel = { [weak self, weak panel] in
+            guard let self else { return }
+            self.pendingNativeTranslation = nil
+            if self.translationReviewPanel === panel {
+                self.translationReviewPanel = nil
+            }
+        }
+        translationReviewPanel = panel
+        panel.orderFrontRegardless()
+    }
+
+    private func showNativeTextTranslationSuccess(_ message: String) {
+        guard let button = statusItem?.button else { return }
+        button.image = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: message)
+        button.toolTip = message
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let button = self?.statusItem?.button else { return }
+            button.image = NSImage(
+                systemSymbolName: "character.bubble",
+                accessibilityDescription: "Screenshot Clipboard"
+            )
+            button.toolTip = "Screenshot Clipboard"
+        }
+    }
+
+    private func showNativeTextTranslationError(_ error: Error) {
+        let primaryTitle: String?
+        let primaryAction: (() -> Void)?
+        if let translationError = error as? NativeTextTranslationError {
+            switch translationError {
+            case .accessibilityRequired:
+                primaryTitle = "Accessibility’i aç"
+                primaryAction = { [weak self] in
+                    AccessibilityTextSelection.openSettings()
+                    self?.translationFeedbackPanel?.close()
+                }
+            case .languageModelsNotInstalled, .unsupportedLanguagePair:
+                primaryTitle = "Dil ayarlarını aç"
+                primaryAction = { [weak self] in
+                    self?.openTranslationSettings(nil)
+                    self?.translationFeedbackPanel?.close()
+                }
+            default:
+                primaryTitle = nil
+                primaryAction = nil
+            }
+        } else {
+            primaryTitle = nil
+            primaryAction = nil
+        }
+
+        showFeedback(
+            title: "Metin çevrilemedi",
+            detail: error.localizedDescription,
+            primaryTitle: primaryTitle,
+            primaryAction: primaryAction
+        )
+    }
+
+    private func showFeedback(
+        title: String,
+        detail: String,
+        primaryTitle: String? = nil,
+        primaryAction: (() -> Void)? = nil
+    ) {
+        translationFeedbackPanel?.close()
+        let panel = TranslationFeedbackPanel(title: title, detail: detail, primaryTitle: primaryTitle)
+        panel.onPrimaryAction = primaryAction
+        panel.onDismiss = { [weak self, weak panel] in
+            guard let self, self.translationFeedbackPanel === panel else { return }
+            self.translationFeedbackPanel = nil
+        }
+        translationFeedbackPanel = panel
+        panel.orderFrontRegardless()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self, weak panel] in
+            guard let self, let panel, self.translationFeedbackPanel === panel else { return }
+            panel.close()
+            self.translationFeedbackPanel = nil
+        }
+    }
+
     @objc private func moveImageToTrash(_ sender: Any?) {
         guard let context = context(from: sender), let fileURL = context.fileURL else { return }
 
@@ -804,32 +1411,23 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showTranslationError(_ error: Error) {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Çeviri gönderilemedi"
-        alert.informativeText = error.localizedDescription
-
-        if let translationError = error as? ExternalAppTranslationError,
-           case .accessibilityRequired = translationError {
-            alert.addButton(withTitle: "Accessibility Ayarlarını Aç")
-            alert.addButton(withTitle: "İptal")
-            if alert.runModal() == .alertFirstButtonReturn {
-                externalAppTranslator.openAccessibilitySettings()
-            }
-            return
-        }
-
-        alert.addButton(withTitle: "Tamam")
-        alert.runModal()
+        let needsAccessibility = (error as? ExternalAppTranslationError).map {
+            if case .accessibilityRequired = $0 { return true }
+            return false
+        } ?? false
+        showFeedback(
+            title: "Çeviri gönderilemedi",
+            detail: error.localizedDescription,
+            primaryTitle: needsAccessibility ? "Accessibility’i aç" : nil,
+            primaryAction: needsAccessibility ? { [weak self] in
+                self?.externalAppTranslator.openAccessibilitySettings()
+                self?.translationFeedbackPanel?.close()
+            } : nil
+        )
     }
 
     private func showOCRResult(title: String, detail: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = detail
-        alert.addButton(withTitle: "Tamam")
-        alert.runModal()
+        showFeedback(title: title, detail: detail)
     }
 
     private func makePreviewImage(from data: Data) -> NSImage? {
@@ -989,8 +1587,7 @@ final class ScreenshotClipboardDelegate: NSObject, NSApplicationDelegate {
         container.addSubview(galleryToggleButton)
 
         panel.contentView = container
-        NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
+        panel.orderFrontRegardless()
 
         previewPanels.removeAll { !$0.isVisible }
         if previewPanels.count >= 3 {
