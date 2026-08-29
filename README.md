@@ -12,7 +12,11 @@ file for later use.
 It is intentionally built as a dependency-free Swift/AppKit app. The helper
 does not need an API key, account, server, or background network service.
 
-![Screenshot Clipboard demo](docs/assets/demo.gif)
+![Screenshot Clipboard feature tour: preview, right-click actions, and Turkish-English translation](docs/assets/demo.gif)
+
+The feature tour shows the preview and clipboard flow, the per-image right-click
+menu (`Preview`, Finder, OCR, ChatGPT, Gemini, and Trash), and the native
+Turkish ↔ English translation options.
 
 ## Why this exists
 
